@@ -36,7 +36,7 @@ def scrape_it(url='', mimes=[]):
     is_desired_type = (any(m in link_content_type for m in mimes))
     if (is_desired_type):
       print(f"Found content {link_content_type} at {link_url}")
-      results.append((link_url, link_request.content))
+      yield (link_url, link_request.content)
   pass
 
 def scrape_it_main(args):
@@ -46,13 +46,15 @@ def scrape_it_main(args):
     rslt = scrape_it(url=url, mimes=args.content)
     results[url] = rslt
 
-  for url in results.keys:
-    url_results = join(os.path.dirname(os.path.realpath(__file__)), f"result/{url}")
-    os.makedirs(url_results)
-    for link_url, content in results[url]:
+  for url in args.url:
+    split_base_url = urlsplit(url)
+    url_results = join(os.path.dirname(os.path.realpath(__file__)), join("result", os.path.basename(os.path.normpath(split_base_url.path))))
+    if not os.path.isdir(url_results):
+      os.makedirs(url_results)
+    for link_url, content in scrape_it(url=url, mimes=args.content):
       split_url = urlsplit(link_url)
       url_fname = os.path.basename(os.path.normpath(split_url.path))
-      fh = open(join(url_results, url_fname), "w")
+      fh = open(join(url_results, url_fname), "wb")
       fh.write(content)
       fh.close()
       # make file for link
