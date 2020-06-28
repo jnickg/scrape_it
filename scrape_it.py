@@ -1,4 +1,6 @@
 import os
+import sys
+import atexit
 from os.path import isfile, join
 import threading
 import concurrent.futures
@@ -12,18 +14,95 @@ from tld import get_tld
 import tempfile
 import fpdf
 from fpdf import FPDF
+import pythoncom
 import win32com.client as win32
+import time
+from multiprocessing.pool import ThreadPool
 
 CONFIG_RESULT_DIR='results'
 
+rslt_key_doc = 'doc'
 fpdf.set_global("SYSTEM_TTFONTS", join(os.path.dirname(__file__), join('res','fonts')))
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 wdFormatPDF = 17
+wdNoProtection = -1 # https://docs.microsoft.com/en-us/dotnet/api/microsoft.office.interop.word.wdprotectiontype?view=word-pia
 wdDoNotSaveChanges = 0
+wdDialogFileOpen = 80
+wdAlertsNone = 0
+wdOpenFormatDocument = 1
 
 com_app_word = None
+com_app_pool_sz = 1
+com_app_pool = ThreadPool(processes=com_app_pool_sz)
+
+def com_app_word_reopen():
+  global com_app_word
+  if com_app_word is not None:
+    # print("Nabbing dialog box thing")
+    # dialog = com_app_word.Dialogs.Item(wdDialogFileOpen)
+    # dialog.Execute()
+    try:
+      print("Quitting MS Word...")
+      com_app_word.Quit(0, 1, False)
+    except:
+      print("Failed to close")
+      pass
+    com_app_word = None
+  print("Launching MS Word...")
+  com_app_word = win32.Dispatch("Word.Application")
+  com_app_word.DisplayAlerts = wdAlertsNone
+  com_app_word.Visible = False
 
 visited_links = []
+
+def open_doc_thread(app_id, fname):
+  pythoncom.CoInitialize()
+  app = win32.Dispatch(pythoncom.CoGetInterfaceAndReleaseStream(app_id, pythoncom.IID_IDispatch))
+  doc = app.Documents.Open(fname, PasswordDocument='wrong password', ReadOnly=True)
+  doc.Activate()
+  doc_id = pythoncom.CoMarshalInterThreadInterfaceInStream(pythoncom.IID_IDispatch, doc)
+  return doc_id
+
+def open_doc_in_thread(app, fname, pool):
+  app_id = pythoncom.CoMarshalInterThreadInterfaceInStream(pythoncom.IID_IDispatch, app)
+  return pool.apply_async(open_doc_thread, (app_id, fname))
+
+def com_open_doc(fname):
+  global com_app_word
+  global com_app_pool
+  doc = None
+  try:
+    print(f"Attempting to open {fname}...")
+    doc_promise = open_doc_in_thread(com_app_word, fname, com_app_pool)
+    doc = doc_promise.wait(2.5)
+    if (doc_promise.ready() is False):
+      raise ValueError(f"Failed to open {fname} (timeout).")
+    doc_id = doc_promise.get() # may re-raise exception
+    doc = com_app_word.ActiveDocument # We should probably marshal this from the thread, but whatever
+    if (doc.HasPassword):
+      raise PermissionError(f"Document {fname} is password-protected. Can copy text but CANNOT use COM to file-convert!")
+    if (com_app_word.ProtectedViewWindows.Count > 0):
+      print(f"Editing protected-view document: {fname}")
+      doc = com_app_word.ActiveProtectedViewWindow.Edit()
+    doc.ReadOnlyRecommended = False
+    if (doc.ProtectionType != wdNoProtection):
+      print(f"Unprotecting protected document: {fname}")
+      doc.Unprotect()
+  except:
+    if (doc is not None):
+      try:
+        doc.Close(wdDoNotSaveChanges)
+      except:
+        print("Failed to close a document!")
+      doc = None
+    com_app_word_reopen()
+    raise
+  return doc
+
+def requests_get_with_wait(url):
+  time.sleep(0.5)
+  print(f"Getting url: {url}...")
+  return requests.get(url, allow_redirects=True, verify=False)
 
 def dump_txt_to_pdf(dest='file_dest', content=''):
   dump_txt_to_txt(f"{dest}.txt", content)
@@ -40,35 +119,30 @@ def dump_txt_to_pdf(dest='file_dest', content=''):
   pdf.output(f"{dest}.pdf")
 
 def dump_txt_to_txt(dest='file_dest', content=''):
-  fh = open(dest, "wb")
-  fh.write(content.encode('utf8'))
+  fh = open(f"{dest}.txt", "wb")
+  fh.write(content)
   fh.close()
 
 def dump_rtf_to_txt(dest='file_dest', content=None):
-  global com_app_word
   text = ""
   with tempfile.NamedTemporaryFile("w+b", delete=False, suffix=".rtf") as c:
     c.write(content)
     c.close()
-    com_app_word.Documents.Open(c.name)
-    doc = com_app_word.ActiveDocument
+    doc = com_open_doc(c.name)
     text = doc.Content.Text 
     doc.Close(wdDoNotSaveChanges)
     try:
       os.remove(c.name)
     except:
       pass
-  return dump_txt_to_txt(dest=dest, content=text)
+  return dump_txt_to_txt(dest=dest, content=text.encode('utf8'))
 
 def dump_rtf_to_pdf(dest='file_dest', content=None):
-  global com_app_word
   with tempfile.NamedTemporaryFile("w+b", delete=False, suffix=".rtf") as c:
     c.write(content)
     c.close()
-    com_app_word.Documents.Open(c.name)
-    doc = com_app_word.ActiveDocument
-    doc.ReadOnlyRecommended = False
-    doc.SaveAs(f"{dest}.pdf", FileFormat=wdFormatPDF)
+    doc = com_open_doc(c.name)
+    doc.SaveCopyAs(f"{dest}.pdf", FileFormat=wdFormatPDF)
     doc.Close(wdDoNotSaveChanges)
     try:
       os.remove(c.name)
@@ -76,21 +150,32 @@ def dump_rtf_to_pdf(dest='file_dest', content=None):
       pass
 
 def dump_doc_to_pdf(dest='file_dest', content=None):
-  global com_app_word
   with tempfile.NamedTemporaryFile("w+b", delete=False, suffix=".doc") as c:
     c.write(content)
     c.close()
-    com_app_word.Documents.Open(c.name)
-    doc = com_app_word.ActiveDocument
-    doc.ReadOnlyRecommended = False
-    doc.SaveAs(f"{dest}.pdf", FileFormat=wdFormatPDF)
+    doc = com_open_doc(c.name)
+    doc.SaveCopyAs(f"{dest}.pdf", FileFormat=wdFormatPDF)
     doc.Close(wdDoNotSaveChanges)
     try:
       os.remove(c.name)
     except:
       pass
 
-def dump_content(dest='file_dest', content=None, mime='application/octet-stream', dest_ext='txt'):
+def dump_doc_to_txt(dest='file_dest', content=None):
+  text = ""
+  with tempfile.NamedTemporaryFile("w+b", delete=False, suffix=".doc") as c:
+    c.write(content)
+    c.close()
+    doc = com_open_doc(c.name)
+    text = doc.Content.Text 
+    doc.Close(wdDoNotSaveChanges)
+    try:
+      os.remove(c.name)
+    except:
+      pass
+  return dump_txt_to_txt(dest=dest, content=text.encode('utf8'))
+
+def dump_content_internal(dest='file_dest', content=None, mime='application/octet-stream', dest_ext='txt'):
   if ('text/plain' in mime):
     if (dest_ext=='pdf'):
       return dump_txt_to_pdf(dest=dest, content=content)
@@ -105,133 +190,105 @@ def dump_content(dest='file_dest', content=None, mime='application/octet-stream'
       return dump_rtf_to_txt(dest=dest, content=content)
     else:
       raise ValueError(f"Unsupported extension {dest_ext}")
-  elif ('application/msword' in mime):
+  elif ('application/msword' in mime or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' in mime):
     if (dest_ext=='pdf'):
       dump_doc_to_pdf(dest=dest, content=content)
+    elif(dest_ext=='txt'):
+      return dump_doc_to_txt(dest=dest, content=content)
     else:
       raise ValueError(f"Unsupported extension {dest_ext}")
 
+def dump_content(dest='file_dest', content=None, mime='application/octet-stream', dest_ext='txt'):
+  dumped = 0
+  try:
+    dump_content_internal(dest=dest, content=content, mime=mime, dest_ext=dest_ext)
+    dumped += 1
+  except:
+    print(f"Failed to dump content to file {dest}.{dest_ext} due to error: {sys.exc_info()}")
+  return dumped
 
-def scrape_it(url='', mimes=[]):
-  results = []
-  split_url = urlsplit(url)
-  domain = f"{split_url.scheme}://{split_url.netloc}"
-  print(f"Accessing URL {url} from domain {domain}...")
-  base_request = requests.get(url, allow_redirects=True, verify=False)
-  print("Success. Parsing HTML...")
-  soup = bs4.BeautifulSoup(base_request.content, features='html.parser')
-  all_links = soup.findAll('a')
-  print(f"Found {len(all_links)} links")
-  for link in all_links:
-    slug = link.get("href")
-    link_url = f"{domain}/{slug}"
-    link_response = requests.get(link_url, allow_redirects=True, verify=False)
-    link_content_type = link_response.headers['Content-Type']
-    is_desired_type = (any(m in link_content_type for m in mimes))
-    if (is_desired_type):
-      print(f"Found content {link_content_type} at {link_url}")
-      yield (link_url, link_response.content, link_response.headers['Content-Type'])
-  pass
+def dump_file_exists(dest='file_dest', dest_ext='txt'):
+  return os.path.isfile(f"{dest}.{dest_ext}")
 
 def get_links_for(url='', response=None, visited=[], same_domain=True, domain=None):
   split_url = urlsplit(url)
   print(f"Getting {url}...")
   if response is None:
-    response = requests.get(url, allow_redirects=True, verify=False)
+    response = requests_get_with_wait(url)
   soup = bs4.BeautifulSoup(response.content, features='html.parser')
   all_links = soup.findAll('a')
   return [urljoin(domain, l.get("href")) for l in all_links if ((l.get("href") not in visited) and (not same_domain or domain is None or domain in urljoin(domain, l.get("href"))))]
 
-
-def scrape_url(url='', response=None, mimes=[], destfmt='txt', baseurl=None, working_dir=None, executor=None):
+def scrape_url_recursive(url='', mimes=[], destfmt='txt', domain=None, working_dir=None, executor=None):
   global visited_links
-  if (url in visited_links):
-    print(f"{url} | Skipping already-visited link")
+  # Normalize link via urljoin
+  normalized_url = urljoin(domain, url)
+  split_url = urlsplit(normalized_url)
+
+  # Check if normalized link has been visited. If so, return
+  if (normalized_url in visited_links):
+    print(f"{url} | Skipping already-visited URL!")
     return 0
 
-  split_url = urlsplit(url)
+  # If not, create directory and update working dir
+  response_dest = os.path.basename(os.path.normpath(split_url.path)) # this may be a directory or filename
 
-  if executor is None:
-    raise ValueError("Can't do this!")
+  # Check if a dump for this link is already present
+  if (dump_file_exists(dest=join(working_dir, response_dest), dest_ext=destfmt)):
+    print(f"{url} | Skipping already-visited URL (file downloaded in previous run)!")
+    return 0
 
-  if baseurl is None:
-    baseurl = split_url.netloc
-  domain = f"{split_url.scheme}://{split_url.netloc}"
-  print(f"{url} | Accessing URL from domain {domain}...")
+  # Get URL and add it to visited links
+  r = requests_get_with_wait(normalized_url)
+  visited_links.append(normalized_url)
 
-  if working_dir is None:
-    working_dir = os.getcwd()
+  # Check if it is mime content. If so, save it to working dir, and return
+  r_headers_content_type = r.headers['Content-Type']
+  if (any(m in r_headers_content_type for m in mimes)):
+    return dump_content(dest=join(working_dir, response_dest), content=r.content, mime=r_headers_content_type, dest_ext=destfmt)
+  # If response is text/html, recurse through links
+  elif ('text/html' in r_headers_content_type):
+    working_dir = join(working_dir, response_dest)
+    if not os.path.isdir(working_dir):
+      os.makedirs(working_dir, exist_ok=True)
+    links = get_links_for(url, r, visited_links, same_domain=True, domain=domain)
+    content_grabbed = 0
+    for l in links:
+      content_grabbed += scrape_url_recursive(url=l, mimes=mimes, destfmt=destfmt, domain=domain, working_dir=working_dir, executor=executor)
+    return content_grabbed
+  else:
+    print(f"Skipping content of type {r_headers_content_type}")
+    return 0
 
-  # Step into results directory for this URL path
-  results_dir = os.path.basename(os.path.normpath(split_url.path))
-  working_dir = join(working_dir, results_dir)
-  if not os.path.isdir(working_dir):
-    os.makedirs(working_dir, exist_ok=True)
-
-  # Get child links
-  links = get_links_for(url, response, visited_links, same_domain=True, domain=domain)
-  print(f"{url} | Found {len(links)} links total")
-  visited_links.append(url)
-
-  sub_scrape_futures = []
-  # Scrape each link.
-  link_responses = [requests.get(l, allow_redirects=True, verify=False) for l in links]
-
-  #   If the link is for text/html, recurse
-  sub_page_responses = [r for r in link_responses if 'text/html' in r.headers['Content-Type']]
-  sub_page_responses = [r for r in sub_page_responses if r.url not in visited_links]
-  print(f"{url} | Found {len(sub_page_responses)} new responses that are also HTML pages. Creating jobs...")
-  for r in sub_page_responses:
-    f = executor.submit(scrape_url, response=r, url=r.url, mimes=mimes, destfmt=destfmt, baseurl=baseurl, working_dir=working_dir, executor=executor)
-    sub_scrape_futures.append(f)
-
-  #   Otherwise, check if it's one of the mimes we care about
-  content_responses = [r for r in link_responses if r not in sub_page_responses] # Filter known HTML
-  content_responses = [r for r in content_responses if any(m in r.headers['Content-Type'] for m in mimes)] # Filter for MIME
-  content_grabbed = 0
-  print(f"{url} | Found {len(content_responses)} responses that are desired content. Creating jobs...")
-  for r in content_responses:
-    content_type = r.headers['Content-Type']
-    print(f"{url} | Found content {content_type} at {r.url}")
-    url_fname = os.path.basename(os.path.normpath(split_url.path))
-    dump_content(dest=join(working_dir, url_fname), content=r.content, mime=content_type, dest_ext=args.desttype)
-    content_grabbed += 1
-
-  for f in concurrent.futures.as_completed(sub_scrape_futures):
-    content_grabbed += f.result()
-
-  return content_grabbed
+def scrape_it_atexit():
+  global com_app_word
+  if (com_app_word is not None):
+    try:
+      com_app_word.Quit(0, 1, False)
+    except:
+      pass
+    com_app_word = None
+  pythoncom.CoUninitialize()
 
 def scrape_it_recursive(args):
   global com_app_word
-  com_app_word = win32.Dispatch("Word.Application")
-  com_app_word.Visible = False
+  pythoncom.CoInitialize()
+  com_app_word_reopen()
+  print(f"Using MS word version: {com_app_word.Version}")
+  atexit.register(scrape_it_atexit)
   
   if not os.path.isdir(CONFIG_RESULT_DIR):
-    os.makedirs(CONFIG_RESULT_DIR)
+    os.makedirs(CONFIG_RESULT_DIR, exist_ok=True)
 
   global visited_links
   visited_links = []
   with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
     for url in args.url:
       print(f"Starting with {url}...")
-      scrape_url(url=url, mimes=args.content, destfmt=args.desttype, working_dir=CONFIG_RESULT_DIR, executor=executor)
+      split_url = urlsplit(url)
+      domain = f"{split_url.scheme}://{split_url.netloc}"
+      scrape_url_recursive(url=url, mimes=args.content, destfmt=args.desttype, domain=domain, working_dir=CONFIG_RESULT_DIR, executor=executor)
 
-
-def scrape_it_main(args):
-  global com_app_word
-  com_app_word = win32.Dispatch("Word.Application")
-  com_app_word.Visible = False
-  for url in args.url:
-    split_base_url = urlsplit(url)
-    url_results = join(os.path.dirname(os.path.realpath(__file__)), join("result", os.path.basename(os.path.normpath(split_base_url.path))))
-    if not os.path.isdir(url_results):
-      os.makedirs(url_results)
-    for link_url, content, mime in scrape_it(url=url, mimes=args.content):
-      split_url = urlsplit(link_url)
-      url_fname = os.path.basename(os.path.normpath(split_url.path))
-      dump_content(dest=join(url_results, url_fname), content=content, mime=mime, dest_ext=args.desttype)
-  com_app_word.Quit()
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(prog="scrape_id.py", description="A web scraper designed for peeling text files from a site")
